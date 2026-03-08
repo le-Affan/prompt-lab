@@ -14,11 +14,11 @@
 
 ## Overview
 
-Project Brain is a system for structured prompt engineering.
+Prompt Lab is a system for structured prompt engineering.
 
 Modern interaction with large language models is largely stateless and experimental. Prompts are rewritten repeatedly, experiments are difficult to reproduce, and insights are easily lost between sessions.
 
-Project Brain introduces a structured workflow for prompt development by providing:
+Prompt Lab introduces a structured workflow for prompt development by providing:
 
 * Prompt version control
 * Controlled experimentation across prompts and models
@@ -31,7 +31,7 @@ The system transforms prompt iteration from ad-hoc trial-and-error into a reprod
 
 ## System Structure
 
-Project Brain consists of two primary layers.
+Prompt Lab consists of two primary layers.
 
 ### Playground (Prompt Lab)
 
@@ -156,7 +156,7 @@ This starts:
 
 ## Project Goals
 
-Project Brain aims to make prompt engineering:
+Prompt Lab aims to make prompt engineering:
 
 * reproducible
 * measurable
