@@ -10,6 +10,7 @@ used throughout the A/B testing engine. No execution logic lives here yet.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import random
 import time
 from abc import ABC, abstractmethod
@@ -54,6 +55,8 @@ __all__ = [
 DEFAULT_MAX_VARIANTS: int = 6
 DEFAULT_TIMEOUT_SECONDS: float = 30.0
 DEFAULT_MAX_CONCURRENCY: int = 5
+
+_current_run_id: contextvars.ContextVar[str] = contextvars.ContextVar("current_run_id", default="")
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +152,7 @@ class ExperimentRun:
     """The aggregated results of running all variants in an experiment."""
 
     experiment_id: str
+    run_id: str
     started_at: datetime
     completed_at: datetime
     variant_results: List[VariantResult] = field(default_factory=list)
@@ -365,7 +369,8 @@ class OpenAIAdapter(LLMAdapter):
                     error_message=f"rate_limit: too many requests — {exc}",
                 )
                 if attempt < 2:
-                    print(f"[RETRY] openai/{model} rate-limited — attempt {attempt + 1}/3, "
+                    run_prefix = f"[{_current_run_id.get()}] " if _current_run_id.get() else ""
+                    print(f"{run_prefix}[RETRY] openai/{model} rate-limited — attempt {attempt + 1}/3, "
                           f"waiting {delay:.0f}s")
                     await asyncio.sleep(delay)
 
@@ -376,7 +381,8 @@ class OpenAIAdapter(LLMAdapter):
                     error_message="timeout: request timed out",
                 )
                 if attempt < 2:
-                    print(f"[RETRY] openai/{model} timed out — attempt {attempt + 1}/3")
+                    run_prefix = f"[{_current_run_id.get()}] " if _current_run_id.get() else ""
+                    print(f"{run_prefix}[RETRY] openai/{model} timed out — attempt {attempt + 1}/3")
 
             except (ConnectionError, OSError) as exc:
                 last_result = ExecutionResult(
@@ -385,7 +391,8 @@ class OpenAIAdapter(LLMAdapter):
                     error_message=f"network_error: connection issue — {exc}",
                 )
                 if attempt < 2:
-                    print(f"[RETRY] openai/{model} network error — attempt {attempt + 1}/3")
+                    run_prefix = f"[{_current_run_id.get()}] " if _current_run_id.get() else ""
+                    print(f"{run_prefix}[RETRY] openai/{model} network error — attempt {attempt + 1}/3")
                     await asyncio.sleep(1.0 * (attempt + 1))
 
             except Exception as exc:  # noqa: BLE001
@@ -526,7 +533,8 @@ class AnthropicAdapter(LLMAdapter):
                     error_message=f"rate_limit: too many requests — {exc}",
                 )
                 if attempt < 2:
-                    print(f"[RETRY] anthropic/{model} rate-limited — attempt {attempt + 1}/3, "
+                    run_prefix = f"[{_current_run_id.get()}] " if _current_run_id.get() else ""
+                    print(f"{run_prefix}[RETRY] anthropic/{model} rate-limited — attempt {attempt + 1}/3, "
                           f"waiting {delay:.0f}s")
                     await asyncio.sleep(delay)
 
@@ -537,7 +545,8 @@ class AnthropicAdapter(LLMAdapter):
                     error_message="timeout: request timed out",
                 )
                 if attempt < 2:
-                    print(f"[RETRY] anthropic/{model} timed out — attempt {attempt + 1}/3")
+                    run_prefix = f"[{_current_run_id.get()}] " if _current_run_id.get() else ""
+                    print(f"{run_prefix}[RETRY] anthropic/{model} timed out — attempt {attempt + 1}/3")
 
             except (ConnectionError, OSError) as exc:
                 last_result = ExecutionResult(
@@ -546,7 +555,8 @@ class AnthropicAdapter(LLMAdapter):
                     error_message=f"network_error: connection issue — {exc}",
                 )
                 if attempt < 2:
-                    print(f"[RETRY] anthropic/{model} network error — attempt {attempt + 1}/3")
+                    run_prefix = f"[{_current_run_id.get()}] " if _current_run_id.get() else ""
+                    print(f"{run_prefix}[RETRY] anthropic/{model} network error — attempt {attempt + 1}/3")
                     await asyncio.sleep(1.0 * (attempt + 1))
 
             except Exception as exc:  # noqa: BLE001
@@ -631,7 +641,8 @@ async def execute_variant(
     Always returns an :class:`ExecutionResult` — never raises.
     """
     tag = f"{config.label} ({config.provider}/{config.model})"
-    print(f"[START] {tag}")
+    run_prefix = f"[{_current_run_id.get()}] " if _current_run_id.get() else ""
+    print(f"{run_prefix}[START] {tag}")
     try:
         adapter = get_adapter(config.provider, config.api_key)
         result = await adapter.execute(
@@ -651,10 +662,10 @@ async def execute_variant(
         )
 
     if result.status == "success":
-        print(f"[END]   {tag} → success ({result.latency_ms} ms, "
+        print(f"{run_prefix}[END]   {tag} → success ({result.latency_ms} ms, "
               f"{result.token_count} tokens)")
     else:
-        print(f"[ERROR] {tag} → {result.status}: {result.error_message}")
+        print(f"{run_prefix}[ERROR] {tag} → {result.status}: {result.error_message}")
 
     return result
 
@@ -742,6 +753,9 @@ async def run_experiment(experiment: Experiment) -> ExperimentRun:
     """
     started_at = datetime.now(timezone.utc)
     run_id = f"run_{int(time.time() * 1000)}"
+    token = _current_run_id.set(run_id)
+
+    print(f"[{run_id}] Starting experiment ({len(experiment.variants)} variants)")
 
     def _failed_result(model: str, reason: str) -> ExecutionResult:
         """Zero-value ExecutionResult for any failure path."""
@@ -809,8 +823,10 @@ async def run_experiment(experiment: Experiment) -> ExperimentRun:
             )
         except asyncio.TimeoutError:
             completed_at = datetime.now(timezone.utc)
+            _current_run_id.reset(token)
             return ExperimentRun(
                 experiment_id=experiment.id,
+                run_id=run_id,
                 started_at=started_at,
                 completed_at=completed_at,
                 variant_results=_all_failed(
@@ -840,8 +856,12 @@ async def run_experiment(experiment: Experiment) -> ExperimentRun:
             )
 
         completed_at = datetime.now(timezone.utc)
+        print(f"[{run_id}] Completed experiment "
+              f"in {(completed_at - started_at).total_seconds() * 1000:.0f} ms")
+        _current_run_id.reset(token)
         return ExperimentRun(
             experiment_id=experiment.id,
+            run_id=run_id,
             started_at=started_at,
             completed_at=completed_at,
             variant_results=variant_results,
@@ -851,8 +871,12 @@ async def run_experiment(experiment: Experiment) -> ExperimentRun:
         # Validation failures, unexpected errors, or anything not caught above
         # are boxed here so the caller always receives a complete ExperimentRun.
         completed_at = datetime.now(timezone.utc)
+        print(f"[{run_id}] Completed experiment with error "
+              f"in {(completed_at - started_at).total_seconds() * 1000:.0f} ms")
+        _current_run_id.reset(token)
         return ExperimentRun(
             experiment_id=experiment.id,
+            run_id=run_id,
             started_at=started_at,
             completed_at=completed_at,
             variant_results=_all_failed(
@@ -1502,6 +1526,9 @@ async def run_cli() -> None:
     if not input_text:
         print("Error: input prompt cannot be empty.")
         return
+    if len(input_text) > 10000:
+        print(f"Error: input prompt is too long ({len(input_text)} > 10000 characters).")
+        return
 
     # --- Step 2: variants ---
     try:
@@ -1519,11 +1546,27 @@ async def run_cli() -> None:
         label = f"Variant {_LABELS[i]}"
         print(f"\n--- {label} ---")
         provider = input("  Provider (e.g. openai / anthropic): ").strip()
+        if not provider:
+            print("  Error: provider cannot be empty. Aborting.")
+            return
+
         model = input("  Model (e.g. gpt-4o / claude-3-sonnet): ").strip()
+        if not model:
+            print("  Error: model cannot be empty. Aborting.")
+            return
+
         api_key = input("  API key (leave blank for mock mode): ").strip()
+
         try:
             temperature = float(input("  Temperature (0.0 – 2.0): ").strip())
+            if not (0.0 <= temperature <= 2.0):
+                print("  Error: temperature must be between 0.0 and 2.0. Aborting.")
+                return
+
             max_tokens = int(input("  Max tokens: ").strip())
+            if max_tokens <= 0:
+                print("  Error: max tokens must be > 0. Aborting.")
+                return
         except ValueError:
             print("  Error: invalid number. Aborting.")
             return
@@ -1547,6 +1590,9 @@ async def run_cli() -> None:
     ).strip()
     try:
         timeout_seconds = float(_timeout_raw) if _timeout_raw else DEFAULT_TIMEOUT_SECONDS
+        if timeout_seconds <= 0:
+            print("  Error: timeout must be > 0. Aborting.")
+            return
     except ValueError:
         print("  Error: invalid timeout. Aborting.")
         return
@@ -1556,6 +1602,9 @@ async def run_cli() -> None:
     ).strip()
     try:
         max_concurrency = int(_concurrency_raw) if _concurrency_raw else DEFAULT_MAX_CONCURRENCY
+        if max_concurrency < 1:
+            print("  Error: concurrency must be >= 1. Aborting.")
+            return
     except ValueError:
         print("  Error: invalid concurrency limit. Aborting.")
         return
