@@ -1111,9 +1111,100 @@ async def run_engine_self_test() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 27. run_cli
+#     Interactive CLI entry point — collects user config, then runs.
+# ---------------------------------------------------------------------------
+
+async def run_cli() -> None:
+    """
+    Interactive command-line interface for the A/B testing engine.
+
+    Prompts the user for:
+    - A shared input prompt
+    - The number of variants and their configs (model, temperature, max_tokens)
+    - How many times to repeat the experiment
+
+    Then builds and runs the experiment ``n`` times, printing a summary
+    after each run using the existing :func:`print_experiment_summary`.
+    """
+    _LABELS = list("ABCDEFGHIJKLMNOP")  # auto-labelling pool
+
+    print("\n" + "=" * 42)
+    print("  Prompt-Lab A/B Testing Engine — CLI")
+    print("=" * 42 + "\n")
+
+    # --- Step 1: shared input prompt ---
+    input_text = input("Enter the input prompt:\n> ").strip()
+    if not input_text:
+        print("Error: input prompt cannot be empty.")
+        return
+
+    # --- Step 2: variants ---
+    try:
+        num_variants = int(input("\nHow many variants? (1–6): ").strip())
+    except ValueError:
+        print("Error: please enter a whole number.")
+        return
+
+    if not (1 <= num_variants <= 6):
+        print("Error: number of variants must be between 1 and 6.")
+        return
+
+    variants: List[VariantConfig] = []
+    for i in range(num_variants):
+        label = f"Variant {_LABELS[i]}"
+        print(f"\n--- {label} ---")
+        model = input("  Model (e.g. gpt-4o / claude-3-sonnet): ").strip()
+        try:
+            temperature = float(input("  Temperature (0.0 – 2.0): ").strip())
+            max_tokens = int(input("  Max tokens: ").strip())
+        except ValueError:
+            print("  Error: invalid number. Aborting.")
+            return
+
+        variants.append(
+            VariantConfig(
+                label=label,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        )
+
+    # --- Step 3: number of runs ---
+    try:
+        num_runs = int(input("\nHow many times should the experiment run? ").strip())
+    except ValueError:
+        print("Error: please enter a whole number.")
+        return
+
+    if num_runs < 1:
+        print("Error: must run at least once.")
+        return
+
+    # --- Step 4: build and execute ---
+    experiment = build_experiment(
+        experiment_id="cli-experiment",
+        name="CLI A/B Test",
+        input_text=input_text,
+        variants=variants,
+    )
+
+    print(f"\nRunning experiment {num_runs} time(s) with {len(variants)} variant(s)...\n")
+
+    for run_number in range(1, num_runs + 1):
+        print(f"--- Run {run_number} of {num_runs} ---")
+        run = await run_experiment(experiment)
+        print_experiment_summary(run)
+        print()
+
+    print("Done.")
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point — run as: python src/AB_Testing.py
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import asyncio as _asyncio  # local alias keeps the global namespace tidy
-    _asyncio.run(run_engine_self_test())
+    _asyncio.run(run_cli())
