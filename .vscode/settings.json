@@ -1,0 +1,26 @@
+{
+  // Python 3.12 venv — used for src/ modules and all tests under tests/
+  // Created with: py -3.12 -m venv .venv312
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv312/Scripts/python.exe",
+
+  // Make Pylance resolve both the top-level src/ package and the API app
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}/src",
+    "${workspaceFolder}/apps/api"
+  ],
+
+  // venv discovery roots
+  "python.venvPath": "${workspaceFolder}",
+
+  // Disable the experimental Python Environment Tools (PET) native locator.
+  // PET is known to crash with Python 3.14 on Windows. The legacy locator
+  // is stable and correctly discovers .venv directories.
+  "python.locator": "default",
+
+  // pytest test discovery
+  "python.testing.pytestEnabled": true,
+  "python.testing.pytestArgs": [
+    "tests"
+  ],
+  "python.testing.unittestEnabled": false
+}
