@@ -108,6 +108,20 @@ class ExecutionResult:
     model: str
     status: str                        # e.g. "success" | "error"
     error_message: Optional[str] = None
+    cost_usd: float = 0.0
+    run_id: Optional[str] = None
+
+
+def estimate_cost(model: str, tokens: int) -> float:
+    """Estimate cost in USD based on model and token usage."""
+    model_lower = model.lower()
+    if "gpt-4" in model_lower:
+        rate = 0.00001
+    elif "claude" in model_lower:
+        rate = 0.000008
+    else:
+        rate = 0.00001
+    return tokens * rate
 
 
 # ---------------------------------------------------------------------------
@@ -265,13 +279,15 @@ class OpenAIAdapter(LLMAdapter):
         await asyncio.sleep(latency_seconds)
         latency_ms = (time.perf_counter() - t_start) * 1_000
         preview = prompt[slice(50)].replace("\n", " ")
+        token_count = random.randint(50, max_tokens)
         return ExecutionResult(
             output_text=f"OpenAI simulated response to: {preview}...",
-            token_count=random.randint(50, max_tokens),
+            token_count=token_count,
             latency_ms=round(latency_ms, 2),
             model=model,
             status="success",
             error_message=None,
+            cost_usd=estimate_cost(model, token_count),
         )
 
     # ------------------------------------------------------------------
@@ -330,6 +346,7 @@ class OpenAIAdapter(LLMAdapter):
                     model=model,
                     status="success",
                     error_message=None,
+                    cost_usd=estimate_cost(model, token_count),
                 )
 
             except openai.AuthenticationError as exc:
@@ -422,13 +439,15 @@ class AnthropicAdapter(LLMAdapter):
         await asyncio.sleep(latency_seconds)
         latency_ms = (time.perf_counter() - t_start) * 1_000
         preview = prompt[slice(50)].replace("\n", " ")
+        token_count = random.randint(50, max_tokens)
         return ExecutionResult(
             output_text=f"Anthropic simulated response to: {preview}...",
-            token_count=random.randint(50, max_tokens),
+            token_count=token_count,
             latency_ms=round(latency_ms, 2),
             model=model,
             status="success",
             error_message=None,
+            cost_usd=estimate_cost(model, token_count),
         )
 
     # ------------------------------------------------------------------
@@ -488,6 +507,7 @@ class AnthropicAdapter(LLMAdapter):
                     model=model,
                     status="success",
                     error_message=None,
+                    cost_usd=estimate_cost(model, token_count),
                 )
 
             except anthropic.AuthenticationError as exc:
@@ -721,6 +741,7 @@ async def run_experiment(experiment: Experiment) -> ExperimentRun:
         :attr:`VariantResult.execution.status` for per-variant outcomes.
     """
     started_at = datetime.now(timezone.utc)
+    run_id = f"run_{int(time.time() * 1000)}"
 
     def _failed_result(model: str, reason: str) -> ExecutionResult:
         """Zero-value ExecutionResult for any failure path."""
@@ -806,6 +827,8 @@ async def run_experiment(experiment: Experiment) -> ExperimentRun:
             else:
                 assert isinstance(raw, ExecutionResult)
                 execution = raw
+
+            execution.run_id = run_id
 
             variant_results.append(
                 VariantResult(
@@ -973,6 +996,8 @@ def summarize_experiment_run(run: ExperimentRun) -> dict:
         (run.completed_at - run.started_at).total_seconds() * 1_000
     )
 
+    total_cost_usd = sum(vr.execution.cost_usd for vr in run.variant_results)
+
     return {
         "experiment_id": run.experiment_id,
         "variant_count": len(run.variant_results),
@@ -980,6 +1005,7 @@ def summarize_experiment_run(run: ExperimentRun) -> dict:
         "failed_variants": len(failed),
         "fastest_variant": fastest.variant_label if fastest is not None else None,
         "total_runtime_ms": total_runtime_ms,
+        "total_cost_usd": total_cost_usd,
     }
 
 
@@ -1567,6 +1593,12 @@ async def run_cli() -> None:
         print(f"--- Run {run_number} of {num_runs} ---")
         run = await run_experiment(experiment)
         all_runs.append(run)
+        
+        run_id_val = run.variant_results[0].execution.run_id if run.variant_results else "unknown"
+        cost_val = sum(v.execution.cost_usd for v in run.variant_results)
+        print(f"Run ID: {run_id_val}")
+        print(f"Total cost: ${cost_val:.4f}")
+
         print_experiment_summary(run)
         print()
 
