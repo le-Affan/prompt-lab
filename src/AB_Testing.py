@@ -198,20 +198,52 @@ class LLMAdapter(ABC):
 
 # ---------------------------------------------------------------------------
 # 7. OpenAIAdapter
-#    Mock concrete adapter simulating an OpenAI API call.
+#    Real OpenAI adapter with mock fallback when api_key is absent.
 # ---------------------------------------------------------------------------
 
 class OpenAIAdapter(LLMAdapter):
     """
-    Simulated OpenAI adapter.
+    OpenAI adapter with automatic mock fallback.
 
-    Mimics the latency and output shape of a real OpenAI API call without
-    using the SDK or making any network requests.  Swap out the body of
-    ``execute`` with the real ``openai.AsyncOpenAI`` client in a later step.
+    Behaviour
+    ---------
+    - **Real mode** (``api_key`` is non-empty): initialises an
+      ``openai.AsyncOpenAI`` client and calls
+      ``chat.completions.create``.  Requires the ``openai`` package
+      (``pip install openai``).
+    - **Mock mode** (``api_key`` is empty or ``openai`` is not
+      installed): falls back to the original simulated response so
+      tests and offline demos continue to work without any keys.
     """
 
     def __init__(self, api_key: str) -> None:
         self.api_key = api_key
+
+    # ------------------------------------------------------------------
+    # Mock helper (unchanged from original implementation)
+    # ------------------------------------------------------------------
+
+    async def _mock_execute(
+        self, prompt: str, model: str, temperature: float, max_tokens: int
+    ) -> ExecutionResult:
+        """Original simulated response — used when no real API key is provided."""
+        latency_seconds = random.uniform(0.1, 0.8)
+        t_start = time.perf_counter()
+        await asyncio.sleep(latency_seconds)
+        latency_ms = (time.perf_counter() - t_start) * 1_000
+        preview = prompt[slice(50)].replace("\n", " ")
+        return ExecutionResult(
+            output_text=f"OpenAI simulated response to: {preview}...",
+            token_count=random.randint(50, max_tokens),
+            latency_ms=round(latency_ms, 2),
+            model=model,
+            status="success",
+            error_message=None,
+        )
+
+    # ------------------------------------------------------------------
+    # Real API call
+    # ------------------------------------------------------------------
 
     async def execute(
         self,
@@ -220,58 +252,126 @@ class OpenAIAdapter(LLMAdapter):
         temperature: float,
         max_tokens: int,
     ) -> ExecutionResult:
-        """Simulate an OpenAI completion call and return an ExecutionResult."""
+        """
+        Run a real OpenAI completion, or fall back to mock if no key is set.
+
+        Falls back to mock when:
+        - ``api_key`` is empty / whitespace
+        - the ``openai`` package is not installed
+
+        Returns ``status="failed"`` on authentication errors, rate limits,
+        or any other API-level exception.
+        """
+        # --- Fallback path: no key or SDK not available ---
+        if not self.api_key.strip():
+            return await self._mock_execute(prompt, model, temperature, max_tokens)
+
         try:
-            # --- Simulate network + inference latency ---
-            latency_seconds = random.uniform(0.1, 0.8)
+            import openai  # noqa: PLC0415 — lazy import for optional dep
+        except ImportError:
+            return await self._mock_execute(prompt, model, temperature, max_tokens)
+
+        # --- Real API path ---
+        try:
+            client = openai.AsyncOpenAI(api_key=self.api_key)
+
             t_start = time.perf_counter()
-            await asyncio.sleep(latency_seconds)
-            latency_ms = (time.perf_counter() - t_start) * 1_000
+            response = await client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            latency_ms = round((time.perf_counter() - t_start) * 1_000, 2)
 
-            # --- Simulate model output ---
-            preview = prompt[slice(50)].replace("\n", " ")
-            output_text = f"OpenAI simulated response to: {preview}..."
-
-            # --- Simulate token usage ---
-            token_count = random.randint(50, max_tokens)
+            output_text = (
+                response.choices[0].message.content or ""
+                if response.choices
+                else ""
+            )
+            token_count = (
+                response.usage.completion_tokens
+                if response.usage
+                else 0
+            )
 
             return ExecutionResult(
                 output_text=output_text,
                 token_count=token_count,
-                latency_ms=int(latency_ms * 100) / 100.0,
+                latency_ms=latency_ms,
                 model=model,
                 status="success",
                 error_message=None,
             )
 
+        except openai.AuthenticationError as exc:
+            return ExecutionResult(
+                output_text="", token_count=0, latency_ms=0.0, model=model,
+                status="failed",
+                error_message=f"OpenAI authentication error: {exc}",
+            )
+        except openai.RateLimitError as exc:
+            return ExecutionResult(
+                output_text="", token_count=0, latency_ms=0.0, model=model,
+                status="failed",
+                error_message=f"OpenAI rate limit: {exc}",
+            )
         except Exception as exc:  # noqa: BLE001
             return ExecutionResult(
-                output_text="",
-                token_count=0,
-                latency_ms=0.0,
-                model=model,
+                output_text="", token_count=0, latency_ms=0.0, model=model,
                 status="failed",
-                error_message=str(exc),
+                error_message=f"OpenAI error: {exc}",
             )
 
 
 # ---------------------------------------------------------------------------
 # 8. AnthropicAdapter
-#    Mock concrete adapter simulating an Anthropic API call.
+#    Real Anthropic adapter with mock fallback when api_key is absent.
 # ---------------------------------------------------------------------------
 
 class AnthropicAdapter(LLMAdapter):
     """
-    Simulated Anthropic adapter.
+    Anthropic adapter with automatic mock fallback.
 
-    Mimics the latency and output shape of a real Anthropic Messages API
-    call without using the SDK or making any network requests.  Swap out
-    the body of ``execute`` with the real ``anthropic.AsyncAnthropic``
-    client in a later step.
+    Behaviour
+    ---------
+    - **Real mode** (``api_key`` is non-empty): initialises an
+      ``anthropic.AsyncAnthropic`` client and calls
+      ``messages.create``.  Requires the ``anthropic`` package
+      (``pip install anthropic``).
+    - **Mock mode** (``api_key`` is empty or ``anthropic`` is not
+      installed): falls back to the original simulated response so
+      tests and offline demos continue to work without any keys.
     """
 
     def __init__(self, api_key: str) -> None:
         self.api_key = api_key
+
+    # ------------------------------------------------------------------
+    # Mock helper (unchanged from original implementation)
+    # ------------------------------------------------------------------
+
+    async def _mock_execute(
+        self, prompt: str, model: str, temperature: float, max_tokens: int
+    ) -> ExecutionResult:
+        """Original simulated response — used when no real API key is provided."""
+        latency_seconds = random.uniform(0.1, 0.8)
+        t_start = time.perf_counter()
+        await asyncio.sleep(latency_seconds)
+        latency_ms = (time.perf_counter() - t_start) * 1_000
+        preview = prompt[slice(50)].replace("\n", " ")
+        return ExecutionResult(
+            output_text=f"Anthropic simulated response to: {preview}...",
+            token_count=random.randint(50, max_tokens),
+            latency_ms=round(latency_ms, 2),
+            model=model,
+            status="success",
+            error_message=None,
+        )
+
+    # ------------------------------------------------------------------
+    # Real API call
+    # ------------------------------------------------------------------
 
     async def execute(
         self,
@@ -280,38 +380,75 @@ class AnthropicAdapter(LLMAdapter):
         temperature: float,
         max_tokens: int,
     ) -> ExecutionResult:
-        """Simulate an Anthropic completion call and return an ExecutionResult."""
+        """
+        Run a real Anthropic message, or fall back to mock if no key is set.
+
+        Falls back to mock when:
+        - ``api_key`` is empty / whitespace
+        - the ``anthropic`` package is not installed
+
+        Returns ``status="failed"`` on authentication errors, rate limits,
+        or any other API-level exception.
+        """
+        # --- Fallback path: no key or SDK not available ---
+        if not self.api_key.strip():
+            return await self._mock_execute(prompt, model, temperature, max_tokens)
+
         try:
-            # --- Simulate network + inference latency ---
-            latency_seconds = random.uniform(0.1, 0.8)
+            import anthropic  # noqa: PLC0415 — lazy import for optional dep
+        except ImportError:
+            return await self._mock_execute(prompt, model, temperature, max_tokens)
+
+        # --- Real API path ---
+        try:
+            client = anthropic.AsyncAnthropic(api_key=self.api_key)
+
             t_start = time.perf_counter()
-            await asyncio.sleep(latency_seconds)
-            latency_ms = (time.perf_counter() - t_start) * 1_000
+            response = await client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            latency_ms = round((time.perf_counter() - t_start) * 1_000, 2)
 
-            # --- Simulate model output ---
-            preview = prompt[slice(50)].replace("\n", " ")
-            output_text = f"Anthropic simulated response to: {preview}..."
-
-            # --- Simulate token usage ---
-            token_count = random.randint(50, max_tokens)
+            output_text = (
+                response.content[0].text
+                if response.content and hasattr(response.content[0], "text")
+                else ""
+            )
+            token_count = (
+                response.usage.output_tokens
+                if response.usage
+                else 0
+            )
 
             return ExecutionResult(
                 output_text=output_text,
                 token_count=token_count,
-                latency_ms=int(latency_ms * 100) / 100.0,
+                latency_ms=latency_ms,
                 model=model,
                 status="success",
                 error_message=None,
             )
 
+        except anthropic.AuthenticationError as exc:
+            return ExecutionResult(
+                output_text="", token_count=0, latency_ms=0.0, model=model,
+                status="failed",
+                error_message=f"Anthropic authentication error: {exc}",
+            )
+        except anthropic.RateLimitError as exc:
+            return ExecutionResult(
+                output_text="", token_count=0, latency_ms=0.0, model=model,
+                status="failed",
+                error_message=f"Anthropic rate limit: {exc}",
+            )
         except Exception as exc:  # noqa: BLE001
             return ExecutionResult(
-                output_text="",
-                token_count=0,
-                latency_ms=0.0,
-                model=model,
+                output_text="", token_count=0, latency_ms=0.0, model=model,
                 status="failed",
-                error_message=str(exc),
+                error_message=f"Anthropic error: {exc}",
             )
 
 
