@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import json
 import random
 import time
 from abc import ABC, abstractmethod
@@ -1499,7 +1500,67 @@ async def run_engine_self_test() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 27. run_cli
+# 27. load_experiment_from_file
+#     Loads an experiment configuration from a JSON file.
+# ---------------------------------------------------------------------------
+
+def load_experiment_from_file(filepath: str) -> Optional[tuple[Experiment, int]]:
+    """
+    Read a JSON config file and return an (Experiment, runs) tuple.
+    
+    Validates JSON integrity and required schemas. Fails fast returning
+    None and printing clear error messages rather than raising exceptions.
+    """
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(f"Error: configuration file '{filepath}' not found.")
+        return None
+    except json.JSONDecodeError as exc:
+        print(f"Error: invalid JSON in '{filepath}' — {exc}")
+        return None
+
+    try:
+        input_text = data["input_text"]
+        runs = int(data.get("runs", 1))
+        timeout_seconds = float(data.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
+        max_concurrency = int(data.get("max_concurrency", DEFAULT_MAX_CONCURRENCY))
+        
+        raw_variants = data["variants"]
+        variants = []
+        for v in raw_variants:
+            variants.append(
+                VariantConfig(
+                    label=v["label"],
+                    provider=v["provider"],
+                    model=v["model"],
+                    temperature=float(v.get("temperature", 1.0)),
+                    max_tokens=int(v.get("max_tokens", 100)),
+                    api_key=v.get("api_key", ""),
+                )
+            )
+
+        experiment = build_experiment(
+            experiment_id=f"file-exp-{int(time.time())}",
+            name=f"Config: {filepath}",
+            input_text=input_text,
+            variants=variants,
+            timeout_seconds=timeout_seconds,
+            max_concurrency=max_concurrency,
+        )
+        return experiment, runs
+
+    except KeyError as exc:
+        print(f"Error: missing required field in config — {exc}")
+        return None
+    except ValueError as exc:
+        print(f"Error: invalid value in config — {exc}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 28. run_cli
 #     Interactive CLI entry point — collects user config, then runs.
 # ---------------------------------------------------------------------------
 
@@ -1521,114 +1582,135 @@ async def run_cli() -> None:
     print("  Prompt-Lab A/B Testing Engine — CLI")
     print("=" * 42 + "\n")
 
-    # --- Step 1: shared input prompt ---
-    input_text = input("Enter the input prompt:\n> ").strip()
-    if not input_text:
-        print("Error: input prompt cannot be empty.")
-        return
-    if len(input_text) > 10000:
-        print(f"Error: input prompt is too long ({len(input_text)} > 10000 characters).")
-        return
+    print("1. Manual Input")
+    print("2. Load from JSON config file")
+    
+    choice = input("\nSelect an option (1 or 2): ").strip()
+    
+    if choice == "2":
+        filepath = input("Enter path to JSON config file: ").strip()
+        loaded = load_experiment_from_file(filepath)
+        if not loaded:
+            return
+        
+        experiment, num_runs = loaded
+        variants = experiment.variants
+        timeout_seconds = experiment.timeout_seconds
+        max_concurrency = experiment.max_concurrency
 
-    # --- Step 2: variants ---
-    try:
-        num_variants = int(input("\nHow many variants? (1–6): ").strip())
-    except ValueError:
-        print("Error: please enter a whole number.")
-        return
-
-    if not (1 <= num_variants <= 6):
-        print("Error: number of variants must be between 1 and 6.")
-        return
-
-    variants: List[VariantConfig] = []
-    for i in range(num_variants):
-        label = f"Variant {_LABELS[i]}"
-        print(f"\n--- {label} ---")
-        provider = input("  Provider (e.g. openai / anthropic): ").strip()
-        if not provider:
-            print("  Error: provider cannot be empty. Aborting.")
+    elif choice == "1":
+        # --- Step 1: shared input prompt ---
+        input_text = input("Enter the input prompt:\n> ").strip()
+        if not input_text:
+            print("Error: input prompt cannot be empty.")
+            return
+        if len(input_text) > 10000:
+            print(f"Error: input prompt is too long ({len(input_text)} > 10000 characters).")
             return
 
-        model = input("  Model (e.g. gpt-4o / claude-3-sonnet): ").strip()
-        if not model:
-            print("  Error: model cannot be empty. Aborting.")
-            return
-
-        api_key = input("  API key (leave blank for mock mode): ").strip()
-
+        # --- Step 2: variants ---
         try:
-            temperature = float(input("  Temperature (0.0 – 2.0): ").strip())
-            if not (0.0 <= temperature <= 2.0):
-                print("  Error: temperature must be between 0.0 and 2.0. Aborting.")
+            num_variants = int(input("\nHow many variants? (1–6): ").strip())
+        except ValueError:
+            print("Error: please enter a whole number.")
+            return
+
+        if not (1 <= num_variants <= 6):
+            print("Error: number of variants must be between 1 and 6.")
+            return
+
+        variants = []
+        for i in range(num_variants):
+            label = f"Variant {_LABELS[i]}"
+            print(f"\n--- {label} ---")
+            provider = input("  Provider (e.g. openai / anthropic): ").strip()
+            if not provider:
+                print("  Error: provider cannot be empty. Aborting.")
                 return
 
-            max_tokens = int(input("  Max tokens: ").strip())
-            if max_tokens <= 0:
-                print("  Error: max tokens must be > 0. Aborting.")
+            model = input("  Model (e.g. gpt-4o / claude-3-sonnet): ").strip()
+            if not model:
+                print("  Error: model cannot be empty. Aborting.")
+                return
+
+            api_key = input("  API key (leave blank for mock mode): ").strip()
+
+            try:
+                temperature = float(input("  Temperature (0.0 – 2.0): ").strip())
+                if not (0.0 <= temperature <= 2.0):
+                    print("  Error: temperature must be between 0.0 and 2.0. Aborting.")
+                    return
+
+                max_tokens = int(input("  Max tokens: ").strip())
+                if max_tokens <= 0:
+                    print("  Error: max tokens must be > 0. Aborting.")
+                    return
+            except ValueError:
+                print("  Error: invalid number. Aborting.")
+                return
+
+            variants.append(
+                VariantConfig(
+                    label=label,
+                    provider=provider,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    api_key=api_key,
+                )
+            )
+
+        # --- Step 3: experiment-level config ---
+        print("\nExperiment settings (press Enter to use defaults):")
+
+        _timeout_raw = input(
+            f"  Timeout in seconds [{DEFAULT_TIMEOUT_SECONDS}]: "
+        ).strip()
+        try:
+            timeout_seconds = float(_timeout_raw) if _timeout_raw else DEFAULT_TIMEOUT_SECONDS
+            if timeout_seconds <= 0:
+                print("  Error: timeout must be > 0. Aborting.")
                 return
         except ValueError:
-            print("  Error: invalid number. Aborting.")
+            print("  Error: invalid timeout. Aborting.")
             return
 
-        variants.append(
-            VariantConfig(
-                label=label,
-                provider=provider,
-                model=model,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                api_key=api_key,
-            )
+        _concurrency_raw = input(
+            f"  Max concurrent variants [{DEFAULT_MAX_CONCURRENCY}]: "
+        ).strip()
+        try:
+            max_concurrency = int(_concurrency_raw) if _concurrency_raw else DEFAULT_MAX_CONCURRENCY
+            if max_concurrency < 1:
+                print("  Error: concurrency must be >= 1. Aborting.")
+                return
+        except ValueError:
+            print("  Error: invalid concurrency limit. Aborting.")
+            return
+
+        # --- Step 4: number of runs ---
+        try:
+            num_runs = int(input("\nHow many times should the experiment run? ").strip())
+        except ValueError:
+            print("Error: please enter a whole number.")
+            return
+
+        if num_runs < 1:
+            print("Error: must run at least once.")
+            return
+
+        # --- Step 5: build and execute ---
+        experiment = build_experiment(
+            experiment_id="cli-experiment",
+            name="CLI A/B Test",
+            input_text=input_text,
+            variants=variants,
+            timeout_seconds=timeout_seconds,
+            max_concurrency=max_concurrency,
         )
 
-    # --- Step 3: experiment-level config ---
-    print("\nExperiment settings (press Enter to use defaults):")
-
-    _timeout_raw = input(
-        f"  Timeout in seconds [{DEFAULT_TIMEOUT_SECONDS}]: "
-    ).strip()
-    try:
-        timeout_seconds = float(_timeout_raw) if _timeout_raw else DEFAULT_TIMEOUT_SECONDS
-        if timeout_seconds <= 0:
-            print("  Error: timeout must be > 0. Aborting.")
-            return
-    except ValueError:
-        print("  Error: invalid timeout. Aborting.")
+    else:
+        print("Error: invalid choice.")
         return
-
-    _concurrency_raw = input(
-        f"  Max concurrent variants [{DEFAULT_MAX_CONCURRENCY}]: "
-    ).strip()
-    try:
-        max_concurrency = int(_concurrency_raw) if _concurrency_raw else DEFAULT_MAX_CONCURRENCY
-        if max_concurrency < 1:
-            print("  Error: concurrency must be >= 1. Aborting.")
-            return
-    except ValueError:
-        print("  Error: invalid concurrency limit. Aborting.")
-        return
-
-    # --- Step 4: number of runs ---
-    try:
-        num_runs = int(input("\nHow many times should the experiment run? ").strip())
-    except ValueError:
-        print("Error: please enter a whole number.")
-        return
-
-    if num_runs < 1:
-        print("Error: must run at least once.")
-        return
-
-    # --- Step 5: build and execute ---
-    experiment = build_experiment(
-        experiment_id="cli-experiment",
-        name="CLI A/B Test",
-        input_text=input_text,
-        variants=variants,
-        timeout_seconds=timeout_seconds,
-        max_concurrency=max_concurrency,
-    )
 
     print(
         f"\nRunning experiment {num_runs} time(s) | "
