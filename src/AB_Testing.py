@@ -15,7 +15,7 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import List, Optional, cast
+from typing import Callable, List, Optional, cast
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +46,17 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
+# Engine configuration defaults
+# These are referenced by the Experiment dataclass field defaults and by
+# build_experiment / run_cli, so they must be defined before the dataclasses.
+# ---------------------------------------------------------------------------
+
+DEFAULT_MAX_VARIANTS: int = 6
+DEFAULT_TIMEOUT_SECONDS: float = 30.0
+DEFAULT_MAX_CONCURRENCY: int = 5
+
+
+# ---------------------------------------------------------------------------
 # 1. VariantConfig
 #    Represents a single experiment variant configuration.
 # ---------------------------------------------------------------------------
@@ -55,9 +66,11 @@ class VariantConfig:
     """Configuration for a single A/B test variant."""
 
     label: str
+    provider: str
     model: str
     temperature: float
     max_tokens: int
+    api_key: str = ""
     prompt_version_id: Optional[str] = None
 
 
@@ -75,6 +88,9 @@ class Experiment:
     input_text: str
     variants: List[VariantConfig]
     created_at: datetime = field(default_factory=datetime.utcnow)
+    max_variants: int = DEFAULT_MAX_VARIANTS
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +210,9 @@ class OpenAIAdapter(LLMAdapter):
     ``execute`` with the real ``openai.AsyncOpenAI`` client in a later step.
     """
 
+    def __init__(self, api_key: str) -> None:
+        self.api_key = api_key
+
     async def execute(
         self,
         prompt: str,
@@ -251,6 +270,9 @@ class AnthropicAdapter(LLMAdapter):
     client in a later step.
     """
 
+    def __init__(self, api_key: str) -> None:
+        self.api_key = api_key
+
     async def execute(
         self,
         prompt: str,
@@ -299,32 +321,30 @@ class AnthropicAdapter(LLMAdapter):
 #    Add new providers here as they are implemented.
 # ---------------------------------------------------------------------------
 
-ADAPTER_REGISTRY: dict[str, type[LLMAdapter]] = {
+ADAPTER_REGISTRY: dict[str, Callable[[str], LLMAdapter]] = {
     "openai": OpenAIAdapter,
     "anthropic": AnthropicAdapter,
 }
 
 
 # ---------------------------------------------------------------------------
-# 10. get_adapter_for_model
-#     Inspects the model name prefix and returns the appropriate adapter
-#     instance. Raises ValueError for unrecognised models.
+# 10. get_adapter
+#     Looks up the correct adapter by explicit provider name and wires
+#     in the API key.  Raises ValueError for unregistered providers.
 # ---------------------------------------------------------------------------
 
-def get_adapter_for_model(model: str) -> LLMAdapter:
+def get_adapter(provider: str, api_key: str) -> LLMAdapter:
     """
-    Return a concrete ``LLMAdapter`` instance for the given model name.
-
-    Routing rules
-    -------------
-    - ``"gpt-*"``    → :class:`OpenAIAdapter`
-    - ``"claude-*"`` → :class:`AnthropicAdapter`
+    Return a concrete ``LLMAdapter`` instance for the given provider.
 
     Parameters
     ----------
-    model : str
-        Provider-specific model identifier, e.g. ``"gpt-4o"`` or
-        ``"claude-3-5-sonnet-20241022"``.
+    provider : str
+        Provider name, e.g. ``"openai"`` or ``"anthropic"``.
+        Must be a key in :data:`ADAPTER_REGISTRY`.
+    api_key : str
+        The API key forwarded to the adapter constructor.  In mock mode
+        this is stored but never used for actual requests.
 
     Returns
     -------
@@ -334,13 +354,15 @@ def get_adapter_for_model(model: str) -> LLMAdapter:
     Raises
     ------
     ValueError
-        If the model prefix does not match any registered provider.
+        If ``provider`` is not present in :data:`ADAPTER_REGISTRY`.
     """
-    if model.startswith("gpt"):
-        return OpenAIAdapter()
-    if model.startswith("claude"):
-        return AnthropicAdapter()
-    raise ValueError(f"Unsupported model: {model}")
+    adapter_cls = ADAPTER_REGISTRY.get(provider.lower())
+    if adapter_cls is None:
+        raise ValueError(
+            f"Unsupported provider: '{provider}'. "
+            f"Registered providers: {list(ADAPTER_REGISTRY)}"
+        )
+    return adapter_cls(api_key)
 
 
 # ---------------------------------------------------------------------------
@@ -350,29 +372,23 @@ def get_adapter_for_model(model: str) -> LLMAdapter:
 # ---------------------------------------------------------------------------
 
 async def execute_variant(
+    config: VariantConfig,
     prompt: str,
-    model: str,
-    temperature: float,
-    max_tokens: int,
 ) -> ExecutionResult:
     """
     Route a single variant execution to the correct LLM adapter.
 
-    This function is the primary entry-point for running one variant.
-    It handles adapter selection and wraps the call in a top-level
-    safety net so the caller is guaranteed to receive an
-    ``ExecutionResult`` regardless of what goes wrong.
+    Selects the adapter from ``config.provider``, passes ``config.api_key``
+    to the constructor, then delegates to ``adapter.execute``.
+    Always returns an :class:`ExecutionResult` — never raises.
 
     Parameters
     ----------
+    config : VariantConfig
+        The full variant configuration.  ``provider``, ``api_key``,
+        ``model``, ``temperature``, and ``max_tokens`` are all consumed here.
     prompt : str
         The fully-rendered prompt string to send to the model.
-    model : str
-        Provider-specific model identifier used to select the adapter.
-    temperature : float
-        Sampling temperature forwarded to the adapter.
-    max_tokens : int
-        Token limit forwarded to the adapter.
 
     Returns
     -------
@@ -382,19 +398,19 @@ async def execute_variant(
         fields zeroed out.
     """
     try:
-        adapter = get_adapter_for_model(model)
+        adapter = get_adapter(config.provider, config.api_key)
         return await adapter.execute(
             prompt=prompt,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
+            model=config.model,
+            temperature=config.temperature,
+            max_tokens=config.max_tokens,
         )
     except Exception as exc:  # noqa: BLE001
         return ExecutionResult(
             output_text="",
             token_count=0,
             latency_ms=0.0,
-            model=model,
+            model=config.model,
             status="failed",
             error_message=str(exc),
         )
@@ -404,10 +420,6 @@ async def execute_variant(
 # 12. validate_experiment
 #     Enforces safety constraints before any API calls are made.
 # ---------------------------------------------------------------------------
-
-_MAX_VARIANTS = 6
-_TIMEOUT_SECONDS = 30.0
-
 
 def validate_experiment(experiment: Experiment) -> None:
     """
@@ -429,9 +441,9 @@ def validate_experiment(experiment: Experiment) -> None:
     if not experiment.variants:
         raise ValueError("Experiment must have at least one variant.")
 
-    if len(experiment.variants) > _MAX_VARIANTS:
+    if len(experiment.variants) > experiment.max_variants:
         raise ValueError(
-            f"Experiment exceeds the maximum of {_MAX_VARIANTS} variants "
+            f"Experiment exceeds the maximum of {experiment.max_variants} variants "
             f"(got {len(experiment.variants)})."
         )
 
@@ -514,16 +526,31 @@ async def run_experiment(experiment: Experiment) -> ExperimentRun:
         # --- Step 1: validate before touching any adapter ---
         validate_experiment(experiment)
 
-        # --- Step 2: build one coroutine per variant ---
-        tasks = [
-            execute_variant(
-                prompt=experiment.input_text,
-                model=variant.model,
-                temperature=variant.temperature,
-                max_tokens=variant.max_tokens,
-            )
-            for variant in experiment.variants
-        ]
+        # --- Step 2: build one coroutine per variant with semaphore + per-variant timeout ---
+        semaphore = asyncio.Semaphore(experiment.max_concurrency)
+
+        async def run_with_limit(config: VariantConfig) -> ExecutionResult:
+            """Acquire semaphore slot, then run the variant with a per-variant timeout."""
+            async with semaphore:
+                try:
+                    return await asyncio.wait_for(
+                        execute_variant(config=config, prompt=experiment.input_text),
+                        timeout=experiment.timeout_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    return ExecutionResult(
+                        output_text="",
+                        token_count=0,
+                        latency_ms=0.0,
+                        model=config.model,
+                        status="failed",
+                        error_message=(
+                            f"Variant '{config.label}' timed out after "
+                            f"{experiment.timeout_seconds}s"
+                        ),
+                    )
+
+        tasks = [run_with_limit(variant) for variant in experiment.variants]
 
         # --- Step 3: run concurrently under global timeout ---
         try:
@@ -532,7 +559,7 @@ async def run_experiment(experiment: Experiment) -> ExperimentRun:
                     "tuple[ExecutionResult | BaseException, ...]",
                     await asyncio.wait_for(
                         asyncio.gather(*tasks, return_exceptions=True),
-                        timeout=_TIMEOUT_SECONDS,
+                        timeout=experiment.timeout_seconds,
                     ),
                 )
             )
@@ -904,26 +931,31 @@ def create_sample_experiment() -> Experiment:
         variants=[
             VariantConfig(
                 label="Variant A",
+                provider="openai",
                 model="gpt-4o",
                 temperature=0.7,
                 max_tokens=300,
+                api_key="",
                 prompt_version_id=None,
             ),
             VariantConfig(
                 label="Variant B",
+                provider="anthropic",
                 model="claude-3-sonnet",
                 temperature=0.7,
                 max_tokens=300,
+                api_key="",
                 prompt_version_id=None,
             ),
             VariantConfig(
                 label="Variant C",
+                provider="openai",
                 model="gpt-4o",
                 temperature=0.3,
                 max_tokens=300,
+                api_key="",
                 prompt_version_id=None,
             ),
-
         ],
         created_at=datetime.now(timezone.utc),
     )
@@ -972,32 +1004,33 @@ def build_experiment(
     name: str,
     input_text: str,
     variants: List[VariantConfig],
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
 ) -> Experiment:
     """
     Construct an :class:`Experiment` with ``created_at`` set automatically.
 
-    This thin wrapper is the canonical factory for creating experiments from
-    API request payloads.  Callers supply the four business-logic fields;
-    the timestamp is always sourced here so the value is consistent and
-    timezone-aware.
-
     Parameters
     ----------
     experiment_id : str
-        Unique identifier for the experiment (e.g. a UUID from the database).
+        Unique identifier for the experiment.
     name : str
         Human-readable experiment name.
     input_text : str
-        The shared prompt input sent to every variant.
+        The shared prompt sent to every variant.
     variants : List[VariantConfig]
-        The variant configurations to test.  Will be validated by
-        :func:`run_experiment` before any execution begins.
+        Variant configurations; validated by :func:`run_experiment`.
+    timeout_seconds : float
+        Global (and per-variant) timeout in seconds.  Defaults to
+        ``DEFAULT_TIMEOUT_SECONDS`` (30 s).
+    max_concurrency : int
+        Maximum number of variants that execute simultaneously.  Defaults
+        to ``DEFAULT_MAX_CONCURRENCY`` (5).
 
     Returns
     -------
     Experiment
-        A fully-constructed experiment ready to pass to
-        :func:`run_experiment` or :func:`validate_experiment`.
+        Ready to pass to :func:`run_experiment` or :func:`validate_experiment`.
     """
     return Experiment(
         id=experiment_id,
@@ -1005,6 +1038,8 @@ def build_experiment(
         input_text=input_text,
         variants=variants,
         created_at=datetime.now(timezone.utc),
+        timeout_seconds=timeout_seconds,
+        max_concurrency=max_concurrency,
     )
 
 
@@ -1154,7 +1189,9 @@ async def run_cli() -> None:
     for i in range(num_variants):
         label = f"Variant {_LABELS[i]}"
         print(f"\n--- {label} ---")
+        provider = input("  Provider (e.g. openai / anthropic): ").strip()
         model = input("  Model (e.g. gpt-4o / claude-3-sonnet): ").strip()
+        api_key = input("  API key (leave blank for mock mode): ").strip()
         try:
             temperature = float(input("  Temperature (0.0 – 2.0): ").strip())
             max_tokens = int(input("  Max tokens: ").strip())
@@ -1165,13 +1202,36 @@ async def run_cli() -> None:
         variants.append(
             VariantConfig(
                 label=label,
+                provider=provider,
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                api_key=api_key,
             )
         )
 
-    # --- Step 3: number of runs ---
+    # --- Step 3: experiment-level config ---
+    print("\nExperiment settings (press Enter to use defaults):")
+
+    _timeout_raw = input(
+        f"  Timeout in seconds [{DEFAULT_TIMEOUT_SECONDS}]: "
+    ).strip()
+    try:
+        timeout_seconds = float(_timeout_raw) if _timeout_raw else DEFAULT_TIMEOUT_SECONDS
+    except ValueError:
+        print("  Error: invalid timeout. Aborting.")
+        return
+
+    _concurrency_raw = input(
+        f"  Max concurrent variants [{DEFAULT_MAX_CONCURRENCY}]: "
+    ).strip()
+    try:
+        max_concurrency = int(_concurrency_raw) if _concurrency_raw else DEFAULT_MAX_CONCURRENCY
+    except ValueError:
+        print("  Error: invalid concurrency limit. Aborting.")
+        return
+
+    # --- Step 4: number of runs ---
     try:
         num_runs = int(input("\nHow many times should the experiment run? ").strip())
     except ValueError:
@@ -1182,15 +1242,22 @@ async def run_cli() -> None:
         print("Error: must run at least once.")
         return
 
-    # --- Step 4: build and execute ---
+    # --- Step 5: build and execute ---
     experiment = build_experiment(
         experiment_id="cli-experiment",
         name="CLI A/B Test",
         input_text=input_text,
         variants=variants,
+        timeout_seconds=timeout_seconds,
+        max_concurrency=max_concurrency,
     )
 
-    print(f"\nRunning experiment {num_runs} time(s) with {len(variants)} variant(s)...\n")
+    print(
+        f"\nRunning experiment {num_runs} time(s) | "
+        f"{len(variants)} variant(s) | "
+        f"timeout={timeout_seconds}s | "
+        f"concurrency={max_concurrency}\n"
+    )
 
     for run_number in range(1, num_runs + 1):
         print(f"--- Run {run_number} of {num_runs} ---")
