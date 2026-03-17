@@ -141,6 +141,39 @@ class ExperimentRun:
 
 
 # ---------------------------------------------------------------------------
+# 5b. MultiRunSummary
+#     Aggregated analytics across multiple ExperimentRun executions.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MultiRunSummary:
+    """
+    Cross-run analytics produced by :func:`aggregate_runs`.
+
+    Attributes
+    ----------
+    total_runs : int
+        Number of :class:`ExperimentRun` objects that were aggregated.
+    total_variants : int
+        Sum of all variant executions across every run.
+    success_rate_per_variant : dict[str, float]
+        Per-label ratio of successful executions to total runs (0.0–1.0).
+    avg_latency_per_variant : dict[str, float]
+        Per-label mean ``latency_ms`` across successful executions only.
+        Labels with zero successes are omitted.
+    fastest_variant_overall : Optional[str]
+        Label of the variant with the lowest ``avg_latency_per_variant``,
+        or ``None`` if no variant succeeded across any run.
+    """
+
+    total_runs: int
+    total_variants: int
+    success_rate_per_variant: dict
+    avg_latency_per_variant: dict
+    fastest_variant_overall: Optional[str]
+
+
+# ---------------------------------------------------------------------------
 # 6. LLMAdapter
 #    Abstract interface that every LLM provider adapter must implement.
 # ---------------------------------------------------------------------------
@@ -255,73 +288,102 @@ class OpenAIAdapter(LLMAdapter):
         """
         Run a real OpenAI completion, or fall back to mock if no key is set.
 
-        Falls back to mock when:
-        - ``api_key`` is empty / whitespace
-        - the ``openai`` package is not installed
-
-        Returns ``status="failed"`` on authentication errors, rate limits,
-        or any other API-level exception.
+        Falls back to mock when api_key is empty or the openai package is
+        not installed.  In real mode, retries up to 3 times on rate-limit
+        and transient network errors with linear back-off (1 s, 2 s, 3 s).
         """
-        # --- Fallback path: no key or SDK not available ---
+        # --- Fallback path: no key or SDK unavailable ---
         if not self.api_key.strip():
             return await self._mock_execute(prompt, model, temperature, max_tokens)
 
         try:
-            import openai  # noqa: PLC0415 — lazy import for optional dep
+            import openai  # noqa: PLC0415
         except ImportError:
             return await self._mock_execute(prompt, model, temperature, max_tokens)
 
-        # --- Real API path ---
-        try:
-            client = openai.AsyncOpenAI(api_key=self.api_key)
+        # --- Real API path with retry ---
+        client = openai.AsyncOpenAI(api_key=self.api_key)
+        last_result: ExecutionResult | None = None
 
-            t_start = time.perf_counter()
-            response = await client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            latency_ms = round((time.perf_counter() - t_start) * 1_000, 2)
+        for attempt in range(3):
+            try:
+                t_start = time.perf_counter()
+                response = await client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                latency_ms = round((time.perf_counter() - t_start) * 1_000, 2)
 
-            output_text = (
-                response.choices[0].message.content or ""
-                if response.choices
-                else ""
-            )
-            token_count = (
-                response.usage.completion_tokens
-                if response.usage
-                else 0
-            )
+                output_text = (
+                    response.choices[0].message.content or ""
+                    if response.choices else ""
+                )
+                token_count = (
+                    response.usage.completion_tokens if response.usage else 0
+                )
+                return ExecutionResult(
+                    output_text=output_text,
+                    token_count=token_count,
+                    latency_ms=latency_ms,
+                    model=model,
+                    status="success",
+                    error_message=None,
+                )
 
-            return ExecutionResult(
-                output_text=output_text,
-                token_count=token_count,
-                latency_ms=latency_ms,
-                model=model,
-                status="success",
-                error_message=None,
-            )
+            except openai.AuthenticationError as exc:
+                # Auth errors are permanent — no point retrying.
+                return ExecutionResult(
+                    output_text="", token_count=0, latency_ms=0.0, model=model,
+                    status="auth_error",
+                    error_message=f"auth_error: invalid API key — {exc}",
+                )
 
-        except openai.AuthenticationError as exc:
-            return ExecutionResult(
-                output_text="", token_count=0, latency_ms=0.0, model=model,
-                status="failed",
-                error_message=f"OpenAI authentication error: {exc}",
-            )
-        except openai.RateLimitError as exc:
-            return ExecutionResult(
-                output_text="", token_count=0, latency_ms=0.0, model=model,
-                status="failed",
-                error_message=f"OpenAI rate limit: {exc}",
-            )
-        except Exception as exc:  # noqa: BLE001
-            return ExecutionResult(
-                output_text="", token_count=0, latency_ms=0.0, model=model,
-                status="failed",
-                error_message=f"OpenAI error: {exc}",
-            )
+            except openai.RateLimitError as exc:
+                delay = 1.0 * (attempt + 1)
+                last_result = ExecutionResult(
+                    output_text="", token_count=0, latency_ms=0.0, model=model,
+                    status="rate_limited",
+                    error_message=f"rate_limit: too many requests — {exc}",
+                )
+                if attempt < 2:
+                    print(f"[RETRY] openai/{model} rate-limited — attempt {attempt + 1}/3, "
+                          f"waiting {delay:.0f}s")
+                    await asyncio.sleep(delay)
+
+            except asyncio.TimeoutError:
+                last_result = ExecutionResult(
+                    output_text="", token_count=0, latency_ms=0.0, model=model,
+                    status="timeout",
+                    error_message="timeout: request timed out",
+                )
+                if attempt < 2:
+                    print(f"[RETRY] openai/{model} timed out — attempt {attempt + 1}/3")
+
+            except (ConnectionError, OSError) as exc:
+                last_result = ExecutionResult(
+                    output_text="", token_count=0, latency_ms=0.0, model=model,
+                    status="network_error",
+                    error_message=f"network_error: connection issue — {exc}",
+                )
+                if attempt < 2:
+                    print(f"[RETRY] openai/{model} network error — attempt {attempt + 1}/3")
+                    await asyncio.sleep(1.0 * (attempt + 1))
+
+            except Exception as exc:  # noqa: BLE001
+                # Unknown errors are not retried.
+                return ExecutionResult(
+                    output_text="", token_count=0, latency_ms=0.0, model=model,
+                    status="failed",
+                    error_message=f"unknown_error: {exc}",
+                )
+
+        # All 3 attempts exhausted — return last classified result.
+        return last_result or ExecutionResult(
+            output_text="", token_count=0, latency_ms=0.0, model=model,
+            status="failed", error_message="unknown_error: all attempts failed",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -383,73 +445,103 @@ class AnthropicAdapter(LLMAdapter):
         """
         Run a real Anthropic message, or fall back to mock if no key is set.
 
-        Falls back to mock when:
-        - ``api_key`` is empty / whitespace
-        - the ``anthropic`` package is not installed
-
-        Returns ``status="failed"`` on authentication errors, rate limits,
-        or any other API-level exception.
+        Falls back to mock when api_key is empty or the anthropic package is
+        not installed.  In real mode, retries up to 3 times on rate-limit
+        and transient network errors with linear back-off (1 s, 2 s, 3 s).
         """
-        # --- Fallback path: no key or SDK not available ---
+        # --- Fallback path: no key or SDK unavailable ---
         if not self.api_key.strip():
             return await self._mock_execute(prompt, model, temperature, max_tokens)
 
         try:
-            import anthropic  # noqa: PLC0415 — lazy import for optional dep
+            import anthropic  # noqa: PLC0415
         except ImportError:
             return await self._mock_execute(prompt, model, temperature, max_tokens)
 
-        # --- Real API path ---
-        try:
-            client = anthropic.AsyncAnthropic(api_key=self.api_key)
+        # --- Real API path with retry ---
+        client = anthropic.AsyncAnthropic(api_key=self.api_key)
+        last_result: ExecutionResult | None = None
 
-            t_start = time.perf_counter()
-            response = await client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            latency_ms = round((time.perf_counter() - t_start) * 1_000, 2)
+        for attempt in range(3):
+            try:
+                t_start = time.perf_counter()
+                response = await client.messages.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                latency_ms = round((time.perf_counter() - t_start) * 1_000, 2)
 
-            output_text = (
-                response.content[0].text
-                if response.content and hasattr(response.content[0], "text")
-                else ""
-            )
-            token_count = (
-                response.usage.output_tokens
-                if response.usage
-                else 0
-            )
+                output_text = (
+                    response.content[0].text
+                    if response.content and hasattr(response.content[0], "text")
+                    else ""
+                )
+                token_count = (
+                    response.usage.output_tokens if response.usage else 0
+                )
+                return ExecutionResult(
+                    output_text=output_text,
+                    token_count=token_count,
+                    latency_ms=latency_ms,
+                    model=model,
+                    status="success",
+                    error_message=None,
+                )
 
-            return ExecutionResult(
-                output_text=output_text,
-                token_count=token_count,
-                latency_ms=latency_ms,
-                model=model,
-                status="success",
-                error_message=None,
-            )
+            except anthropic.AuthenticationError as exc:
+                # Auth errors are permanent — no point retrying.
+                return ExecutionResult(
+                    output_text="", token_count=0, latency_ms=0.0, model=model,
+                    status="auth_error",
+                    error_message=f"auth_error: invalid API key — {exc}",
+                )
 
-        except anthropic.AuthenticationError as exc:
-            return ExecutionResult(
-                output_text="", token_count=0, latency_ms=0.0, model=model,
-                status="failed",
-                error_message=f"Anthropic authentication error: {exc}",
-            )
-        except anthropic.RateLimitError as exc:
-            return ExecutionResult(
-                output_text="", token_count=0, latency_ms=0.0, model=model,
-                status="failed",
-                error_message=f"Anthropic rate limit: {exc}",
-            )
-        except Exception as exc:  # noqa: BLE001
-            return ExecutionResult(
-                output_text="", token_count=0, latency_ms=0.0, model=model,
-                status="failed",
-                error_message=f"Anthropic error: {exc}",
-            )
+            except anthropic.RateLimitError as exc:
+                delay = 1.0 * (attempt + 1)
+                last_result = ExecutionResult(
+                    output_text="", token_count=0, latency_ms=0.0, model=model,
+                    status="rate_limited",
+                    error_message=f"rate_limit: too many requests — {exc}",
+                )
+                if attempt < 2:
+                    print(f"[RETRY] anthropic/{model} rate-limited — attempt {attempt + 1}/3, "
+                          f"waiting {delay:.0f}s")
+                    await asyncio.sleep(delay)
+
+            except asyncio.TimeoutError:
+                last_result = ExecutionResult(
+                    output_text="", token_count=0, latency_ms=0.0, model=model,
+                    status="timeout",
+                    error_message="timeout: request timed out",
+                )
+                if attempt < 2:
+                    print(f"[RETRY] anthropic/{model} timed out — attempt {attempt + 1}/3")
+
+            except (ConnectionError, OSError) as exc:
+                last_result = ExecutionResult(
+                    output_text="", token_count=0, latency_ms=0.0, model=model,
+                    status="network_error",
+                    error_message=f"network_error: connection issue — {exc}",
+                )
+                if attempt < 2:
+                    print(f"[RETRY] anthropic/{model} network error — attempt {attempt + 1}/3")
+                    await asyncio.sleep(1.0 * (attempt + 1))
+
+            except Exception as exc:  # noqa: BLE001
+                # Unknown errors are not retried.
+                return ExecutionResult(
+                    output_text="", token_count=0, latency_ms=0.0, model=model,
+                    status="failed",
+                    error_message=f"unknown_error: {exc}",
+                )
+
+        # All 3 attempts exhausted — return last classified result.
+        return last_result or ExecutionResult(
+            output_text="", token_count=0, latency_ms=0.0, model=model,
+            status="failed", error_message="unknown_error: all attempts failed",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -515,35 +607,21 @@ async def execute_variant(
     """
     Route a single variant execution to the correct LLM adapter.
 
-    Selects the adapter from ``config.provider``, passes ``config.api_key``
-    to the constructor, then delegates to ``adapter.execute``.
+    Logs [START] before the call and [END] / [ERROR] after it.
     Always returns an :class:`ExecutionResult` — never raises.
-
-    Parameters
-    ----------
-    config : VariantConfig
-        The full variant configuration.  ``provider``, ``api_key``,
-        ``model``, ``temperature``, and ``max_tokens`` are all consumed here.
-    prompt : str
-        The fully-rendered prompt string to send to the model.
-
-    Returns
-    -------
-    ExecutionResult
-        On success: populated with output, token count, and latency.
-        On failure: ``status="failed"``, ``error_message`` set, numeric
-        fields zeroed out.
     """
+    tag = f"{config.label} ({config.provider}/{config.model})"
+    print(f"[START] {tag}")
     try:
         adapter = get_adapter(config.provider, config.api_key)
-        return await adapter.execute(
+        result = await adapter.execute(
             prompt=prompt,
             model=config.model,
             temperature=config.temperature,
             max_tokens=config.max_tokens,
         )
     except Exception as exc:  # noqa: BLE001
-        return ExecutionResult(
+        result = ExecutionResult(
             output_text="",
             token_count=0,
             latency_ms=0.0,
@@ -551,6 +629,14 @@ async def execute_variant(
             status="failed",
             error_message=str(exc),
         )
+
+    if result.status == "success":
+        print(f"[END]   {tag} → success ({result.latency_ms} ms, "
+              f"{result.token_count} tokens)")
+    else:
+        print(f"[ERROR] {tag} → {result.status}: {result.error_message}")
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -895,6 +981,86 @@ def summarize_experiment_run(run: ExperimentRun) -> dict:
         "fastest_variant": fastest.variant_label if fastest is not None else None,
         "total_runtime_ms": total_runtime_ms,
     }
+
+
+# ---------------------------------------------------------------------------
+# 18b. aggregate_runs
+#      Compute cross-run analytics from a list of ExperimentRun objects.
+# ---------------------------------------------------------------------------
+
+def aggregate_runs(runs: List[ExperimentRun]) -> MultiRunSummary:
+    """
+    Aggregate analytics across multiple :class:`ExperimentRun` executions.
+
+    Parameters
+    ----------
+    runs : List[ExperimentRun]
+        One or more completed experiment runs to aggregate.  An empty list
+        returns a zeroed-out :class:`MultiRunSummary`.
+
+    Returns
+    -------
+    MultiRunSummary
+        - ``success_rate_per_variant`` — successes / total_runs per label
+        - ``avg_latency_per_variant``  — mean latency of successful runs per label
+        - ``fastest_variant_overall``  — label with the lowest average latency,
+          or ``None`` when no variant ever succeeded
+    """
+    if not runs:
+        return MultiRunSummary(
+            total_runs=0,
+            total_variants=0,
+            success_rate_per_variant={},
+            avg_latency_per_variant={},
+            fastest_variant_overall=None,
+        )
+
+    total_runs = len(runs)
+    total_variants = sum(len(r.variant_results) for r in runs)
+
+    # Accumulate per-label success counts and latencies.
+    success_counts = {}     # label -> int
+    latency_sums = {}       # label -> float (successful runs only)
+    latency_counts = {}     # label -> int
+
+    for run in runs:
+        for vr in run.variant_results:
+            label = vr.variant_label
+            success_counts.setdefault(label, 0)
+            latency_sums.setdefault(label, 0.0)
+            latency_counts.setdefault(label, 0)
+
+            if vr.execution.status == "success":
+                success_counts[label] += 1
+                latency_sums[label] += vr.execution.latency_ms
+                latency_counts[label] += 1
+
+    # Derive rates and averages — guard against division by zero.
+    success_rate_per_variant = {
+        label: (success_counts[label] / total_runs)
+        for label in success_counts
+    }
+
+    avg_latency_per_variant = {
+        label: (latency_sums[label] / latency_counts[label])
+        for label in latency_counts
+        if latency_counts[label] > 0
+    }
+
+    # Fastest overall = label with lowest average latency.
+    fastest_variant_overall = (
+        min(avg_latency_per_variant, key=avg_latency_per_variant.get)  # type: ignore[arg-type]
+        if avg_latency_per_variant
+        else None
+    )
+
+    return MultiRunSummary(
+        total_runs=total_runs,
+        total_variants=total_variants,
+        success_rate_per_variant=success_rate_per_variant,
+        avg_latency_per_variant=avg_latency_per_variant,
+        fastest_variant_overall=fastest_variant_overall,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1396,13 +1562,39 @@ async def run_cli() -> None:
         f"concurrency={max_concurrency}\n"
     )
 
+    all_runs: List[ExperimentRun] = []
     for run_number in range(1, num_runs + 1):
         print(f"--- Run {run_number} of {num_runs} ---")
         run = await run_experiment(experiment)
+        all_runs.append(run)
         print_experiment_summary(run)
         print()
 
-    print("Done.")
+    # --- Step 6: final cross-run summary ---
+    multi = aggregate_runs(all_runs)
+
+    print("=" * 42)
+    print("  FINAL SUMMARY")
+    print("=" * 42)
+    print(f"Total runs    : {multi.total_runs}")
+    print(f"Total variants: {multi.total_variants}")
+    print()
+    print("Success rate per variant:")
+    for label, rate in multi.success_rate_per_variant.items():
+        print(f"  {label:<20} {rate * 100:.1f}%")
+    print()
+    print("Avg latency per variant (successful runs only):")
+    if multi.avg_latency_per_variant:
+        for label, avg_ms in multi.avg_latency_per_variant.items():
+            print(f"  {label:<20} {avg_ms:.2f} ms")
+    else:
+        print("  (no successful runs)")
+    print()
+    fastest_label = multi.fastest_variant_overall or "None"
+    print(f"Fastest variant overall: {fastest_label}")
+    print("=" * 42)
+
+    print("\nDone.")
 
 
 # ---------------------------------------------------------------------------
